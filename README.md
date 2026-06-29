@@ -52,7 +52,7 @@ Key engineering problems to solve:
 ## Repo layout
 
 ```
-docs/                        # Official challenge documentation (from NVlabs/alpasim@e2e_challenge)
+e2e_challenge/               # Official challenge artifacts from NVlabs/alpasim@e2e_challenge
   README.md                  # Challenge overview, submission contract, constraints
   starter_kit/               # Minimal working driver container (straight-line baseline)
     driver.py                # gRPC servicer implementation to copy and modify
@@ -61,16 +61,17 @@ docs/                        # Official challenge documentation (from NVlabs/alp
   competitor_cli/            # CLI for auth, ECR push, submit, leaderboard
     alpasim_challenge.py
     README.md
+src/grpc/                    # Official alpasim_grpc package used by starter images
 ```
 
 ## Quickstart (local smoke test)
 
 ```bash
 # Build the starter driver
-docker build -f docs/starter_kit/Dockerfile -t alpasim-e2e-starter-driver:latest .
+docker build -f e2e_challenge/starter_kit/Dockerfile -t alpasim-e2e-starter-driver:latest .
 
 # Start the driver container
-docs/starter_kit/run_local_container.sh
+e2e_challenge/starter_kit/run_local_container.sh
 
 # In another terminal — run the PAI smoke test (requires AlpaSim installed)
 source setup_local_env.sh
@@ -86,21 +87,21 @@ uv run alpasim_wizard +e2e_challenge=dev \
 
 ```bash
 # Authenticate (tokens expire after 12 hours)
-uv run docs/competitor_cli/alpasim_challenge.py auth-url
-uv run docs/competitor_cli/alpasim_challenge.py configure-token
+uv run e2e_challenge/competitor_cli/alpasim_challenge.py auth-url
+uv run e2e_challenge/competitor_cli/alpasim_challenge.py configure-token
 
 # Log in to ECR and push your image
-uv run docs/competitor_cli/alpasim_challenge.py ecr-login
+uv run e2e_challenge/competitor_cli/alpasim_challenge.py ecr-login
 docker tag <your-image>:<tag> 696254625193.dkr.ecr.us-east-1.amazonaws.com/teams/<team_id>:<tag>
 docker push 696254625193.dkr.ecr.us-east-1.amazonaws.com/teams/<team_id>:<tag>
 
 # Submit (use pai or nuplan)
-uv run docs/competitor_cli/alpasim_challenge.py submit --track pai \
+uv run e2e_challenge/competitor_cli/alpasim_challenge.py submit --track pai \
   696254625193.dkr.ecr.us-east-1.amazonaws.com/teams/<team_id>:<tag>
 
 # Check status / leaderboard
-uv run docs/competitor_cli/alpasim_challenge.py status <submission_id>
-uv run docs/competitor_cli/alpasim_challenge.py leaderboard --track pai
+uv run e2e_challenge/competitor_cli/alpasim_challenge.py status <submission_id>
+uv run e2e_challenge/competitor_cli/alpasim_challenge.py leaderboard --track pai
 ```
 
 ## References

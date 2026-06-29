@@ -106,7 +106,7 @@ Camera images → Vision encoder → VLM prefill → Diffusion expert → trajec
 - [ ] Register at the [challenge HF Space](https://huggingface.co/spaces/nvidia/AlpasimE2EClosedLoopChallenge2026), get approved
 - [ ] Build the starter driver container:
   ```bash
-  docker build -f docs/starter_kit/Dockerfile -t alpasim-e2e-starter-driver:latest .
+  docker build -f e2e_challenge/starter_kit/Dockerfile -t alpasim-e2e-starter-driver:latest .
   ```
 - [ ] Run local PAI smoke test against AlpaSim
 - [ ] Submit the straight-line baseline to get a leaderboard score
@@ -251,13 +251,13 @@ and Alpagym's `AlpamayoR1InferenceModel` / `AlpamayoPolicy` infrastructure.
 - [ ] Run local smoke test (nuPlan track, if attempting)
 - [ ] Push to ECR:
   ```bash
-  uv run docs/competitor_cli/alpasim_challenge.py ecr-login
+  uv run e2e_challenge/competitor_cli/alpasim_challenge.py ecr-login
   docker tag <image>:<tag> 696254625193.dkr.ecr.us-east-1.amazonaws.com/teams/<team_id>:<tag>
   docker push 696254625193.dkr.ecr.us-east-1.amazonaws.com/teams/<team_id>:<tag>
   ```
 - [ ] Submit:
   ```bash
-  uv run docs/competitor_cli/alpasim_challenge.py submit --track pai \
+  uv run e2e_challenge/competitor_cli/alpasim_challenge.py submit --track pai \
     696254625193.dkr.ecr.us-east-1.amazonaws.com/teams/<team_id>:<tag>
   ```
 - [ ] Check status and leaderboard
@@ -489,7 +489,7 @@ are sufficient.
 | RL doesn't converge or reward collapses | No improvement over distilled baseline | Start with conservative scenes, use `force_gt` warmup, monitor KL/reward with trackio alerts. |
 | Latency still over 0.1s after optimization | Submission disqualified | Reduce diffusion steps, use TensorRT, reduce image resolution, or smaller model. |
 | Docker image over 40 GiB | Submission rejected | Use INT4 weights (~1-5 GB), minimal dependencies, multi-stage build. |
-| AlpaSim local setup is complex | Can't smoke test locally | Follow `docs/starter_kit/README.md` carefully, use `+e2e_challenge=dev` for minimal test. |
+| AlpaSim local setup is complex | Can't smoke test locally | Follow `e2e_challenge/starter_kit/README.md` carefully, use `+e2e_challenge=dev` for minimal test. |
 
 ---
 
