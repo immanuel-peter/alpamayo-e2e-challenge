@@ -391,6 +391,34 @@ SFT and RL combined.
 | Milestones + subset iteration | 3 full + 5×100-scene | ~$1,060 | **Recommended** — subsets ~$30 each |
 | Full iteration | 5–7 full | ~$1,395–1,953 | More data, expensive |
 
+### Splitting work across AWS credits and Brev
+
+~$9K of AWS credits is available. AWS only sells H100/A100-80GB in **8-GPU boxes**
+(`p5.48xlarge`, 8×H100 ~$55/hr; `p4de.24xlarge`, 8×A100-80GB ~$27–41/hr) — there is
+no single-GPU H100/A100 SKU. So AWS is only economical for phases that genuinely
+keep all 8 GPUs busy; anything 1–2 GPU wastes 6–7 GPUs at the box rate. Rule of
+thumb: **fills 8 GPUs → AWS; needs 1–2 GPUs or rapid spin-up/teardown → Brev.**
+
+| Phase | Where | Why |
+|-------|-------|-----|
+| **1: Teacher data gen** | **AWS** (`p4de`, 8×A100) | Embarrassingly parallel over 50K clips — fanning out across 8 GPUs is faster *and* cheaper than the single-A100 plan. ~8–13 hr, ~$300–500 of credits. |
+| **5: RL (aggressive, `8gpu`)** | **AWS** (`p5`, 8×H100) | You'd rent 8 GPUs anyway; credits absorb the dominant RL cost. |
+| **6–7: Milestone full evals** | **AWS** (`p5`, or `p5e`/H200 for >80 GB VRAM) | High parallelism + big VRAM. Stage the 1.5 TB scene suite from S3/FSx for Lustre (no 56 TB local mount, but `p5` has ~30 TB local NVMe). |
+| **0: INT4 quantization gate** | **Brev** (1×H100) | Single-GPU, quick iteration. |
+| **2: SFT distillation** | **Brev** (1–2×H100) | 2B fits on 1–2 GPUs; an 8-GPU AWS box wastes 6. |
+| **3–4: gRPC integration + latency/VRAM tuning** | **Brev** (1×H100) | Constant launch-and-kill; AWS Capacity Blocks make bursty work painful. |
+| **5: RL (moderate, `2gpu`)** | **Brev** (2×H100) | Below the 8-GPU threshold. |
+| **Subset (100-scene) evals** | **Brev** (2×H100 launchpad) | Frequent, small iteration runs. |
+
+**AWS caveats:**
+- **Capacity Blocks for ML** — `p5` on-demand is frequently capacity-constrained.
+  Reserve blocks 1–182 days ahead, paid upfront (credits apply). Plan AWS phases
+  around reserved windows, not impulse launches.
+- **Effective value** — AWS per-GPU (~$6.88/hr H100 on-demand, ~$3.9 via Capacity
+  Block) is ~2–4× Brev's $2.28. Kept fully utilized on 8-GPU boxes, $9K of credits
+  ≈ **$2,500–4,500 of Brev-equivalent compute** — enough to cover the RL + eval
+  phases (the dominant line items) while Brev handles the agile single-GPU loop.
+
 ---
 
 ## Disk Budget
