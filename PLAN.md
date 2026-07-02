@@ -9,13 +9,34 @@ real-world scenes. The submission is a Docker container implementing the
 ## Core Metric
 
 This is **not a trajectory prediction competition**. It is a **closed-loop survival
-competition**. The model that drives the longest without crashing wins. What matters is:
+competition**. The model that drives the longest without crashing wins.
 
+**Leaderboard metrics (as observed from the PAI track):**
+
+| Metric | Direction | Description |
+|--------|-----------|-------------|
+| `policy_capability_score` | Higher is better | **Primary score.** Scale unclear but host's best model = 1600, straight-line baseline = 1000 |
+| `avg_dist_between_incidents_at_fault` | Higher is better | Average distance between at-fault incidents (meters) |
+| `dist_to_gt_trajectory` | Lower is better | Distance to ground-truth trajectory — open-loop proxy |
+
+What matters for RL:
 - **Self-correcting behavior** — small trajectory errors must not compound into crashes
 - **Perception quality** — the model must understand obstacles, road geometry, and routes
 - **Constraint compliance** — ≤0.1s per `drive()` call, ≤16 GiB VRAM, ≤40 GiB image, no network
 
 Open-loop metrics (minADE/minFDE) are irrelevant if the model diverges in closed loop.
+
+**Current leaderboard (PAI track, 2026-07-02):**
+
+| Rank | Team | Score | Notes |
+|------|------|-------|-------|
+| 1 | Host (policy1) | 1600 | NVIDIA reference model |
+| 2 | Alpain Autonomy (vavam) | 1555 | VAVAM sample, cu128 |
+| 3 | Host (policy2) | 1298 | NVIDIA reference model 2 |
+| 4-5 | Fox SRDC / Host (starter) | 1000 | Straight-line baseline |
+| 6 | **Us** (immanuel-peter) | 1000 | Straight-line baseline — tied at floor |
+
+Target: beat 1000 (baseline) → beat 1298 (policy2) → beat 1555 (vavam) → beat 1600 (policy1).
 
 ## Strategy: RL on bf16 10B, Then FP8 Quantize for Deployment
 
@@ -108,14 +129,17 @@ Quantization gate: confirm PTQ preserves perception quality.
 
 - [x] Register at the [challenge HF Space](https://huggingface.co/spaces/nvidia/AlpasimE2EClosedLoopChallenge2026), get approved
 - [x] Get HF access to `nvidia/Alpamayo-1.5-10B` and `nvidia/PhysicalAI-Autonomous-Vehicles`
-- [ ] Build the starter driver container:
+- [x] Build the starter driver container:
   ```bash
   docker build -f e2e_challenge/starter_kit/Dockerfile -t alpasim-e2e-starter-driver:latest .
   ```
 - [ ] Run local PAI smoke test against AlpaSim
-- [ ] Submit the straight-line baseline to get a leaderboard score
-- [ ] Authenticate with the challenge CLI (`auth-url` → `configure-token` → `me`)
-- [ ] Verify ECR login works (`ecr-login`)
+- [x] Submit the straight-line baseline to get a leaderboard score
+  - Submission: `378820c2-8db4-40db-a4e6-a61e4acd1105`, score: 1000 (floor)
+  - Image: `teams/immanuel-peter:starter-baseline-amd64` (linux/amd64, ~99 MB)
+  - Pushed via `crane` (Docker Desktop HEAD manifest 403 bug on ECR)
+- [x] Authenticate with the challenge CLI (`auth-url` → `configure-token` → `me`)
+- [x] Verify ECR login works (`ecr-login`)
 
 **Decision gate (DONE — PASSED):** NVFP4-quantized 10B Alpamayo has sufficient
 perception quality. On 100 PAI gold eval clips, NVFP4 avg minADE = 0.848m
@@ -154,8 +178,9 @@ and Alpagym's `AlpamayoR1InferenceModel` / `AlpamayoPolicy` infrastructure.
   - `last_component="traj_future"` (match deploy path)
   - `num_context_frames`, `num_historical_waypoints`, `num_future_waypoints` matching driver config
 - [ ] Design reward function:
-  - Primary: collision-free duration (directly the competition metric)
-  - Secondary: progress along route (encourage forward motion, not just standing still)
+  - Primary: `policy_capability_score` (the competition's primary metric)
+  - Secondary: `avg_dist_between_incidents_at_fault` (distance between at-fault incidents)
+  - Progress along route (encourage forward motion, not just standing still)
   - Optional: risk-horizon discounting — penalize near-future collisions more than far-future
   - The reward system supports `metric` and `distance_to_gt` term kinds
 - [ ] Configure GRPO:
@@ -302,12 +327,13 @@ in 16 GiB VRAM than a 2B would have been (~1-2 GB).
 Challenge eval runs on 8×H100 (Hopper). NVFP4 is Blackwell-only. FP8
 (E4M3) is Hopper-native and supported by ModelOpt's quant recipe.
 
-### 6. RL reward = collision-free duration
+### 6. RL reward = policy_capability_score
 
-Directly optimizes the competition metric. Progress-along-route as secondary reward
-prevents the degenerate strategy of standing still to avoid collisions. Risk-horizon
-discounting encourages conservative early behavior (survive long enough to accumulate
-reward).
+Directly optimizes the competition's primary metric. The leaderboard ranks on
+`policy_capability_score` (host reference = 1600, baseline = 1000).
+`avg_dist_between_incidents_at_fault` as secondary reward prevents the degenerate
+strategy of standing still to avoid collisions. Risk-horizon discounting encourages
+conservative early behavior (survive long enough to accumulate reward).
 
 ### 7. `force_gt_duration_us` warmup for RL exploration
 
