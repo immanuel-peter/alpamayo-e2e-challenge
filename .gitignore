@@ -1,0 +1,3 @@
+# Override global gitignore for eval artifacts
+!nvfp4-eval/logs/*.log
+!fp8-eval/logs/*.log

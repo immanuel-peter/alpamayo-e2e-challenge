@@ -126,15 +126,16 @@ perception even less. Distillation is skipped.
 - [x] Quantize 10B Alpamayo to NVFP4 (100 calib clips, ModelOpt 0.43.0)
 - [x] Run eval on 100 clips: bf16 vs NVFP4 minADE comparison
 - [x] Result: NVFP4 minADE 0.848m < 1.0m gate → skip distillation
-- [ ] Run FP8 gate eval on H100 (deployment format, Hopper-native):
+- [x] Run FP8 gate eval on H100 (deployment format, Hopper-native):
   ```bash
-  brev create alpamayo-fp8-gate --type hyperstack_H100
-  # on instance:
-  uv run --active quantize.py --quant_format=fp8 --num_of_calib_clips=100 --save_model_dir=./outputs
-  uv run --active eval.py --ckpt ./outputs/alpamayo1.5_fp8_calib100 --limit 100 --print_every 25
+  # ran on 1× H100 PCIe via fp8-eval/scripts/run_fp8_gate.sh
+  # quantize ~27 min; bf16 eval ~18 min; FP8 eval ~21 min
   ```
-  This tests real FP8 GEMM latency on H100 (not fake-quant on B300) and
-  confirms the deployment quantization quality.
+  **Result (100 clips):** bf16 0.854 m, FP8 **0.836 m** (< 1.0 m gate, PASSED).
+  FP8 checkpoint ~11 GB. Latency: bf16 2.6 s/clip, FP8 5.3 s/clip (2.1×).
+  Note: ModelOpt still reports `RealQuantLinear: No real-quant GEMM found`
+  (fake-quant path on H100 too); latency is not yet optimized Hopper FP8 kernels.
+  Artifacts: `fp8-eval/results/summary.json`, `fp8-eval/logs/`.
 
 ### Phase 1: RL Post-Training (GRPO via Alpagym)
 

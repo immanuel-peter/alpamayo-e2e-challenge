@@ -421,11 +421,8 @@ distillation would have.
 > Hopper-compatible deployment.
 
 **Next steps (revised):**
-1. Update PLAN.md: drop 2B distillation phases, reflect train-then-compress.
-2. Run **FP8 gate eval** on H100 (Brev `hyperstack_H100` at $2.28/hr) — FP8
-   is Hopper-native and is the actual deployment format. Confirm FP8 minADE
-   < 1.0m (very likely, since FP8 < NVFP4 degradation). This also tests
-   real-quant latency on H100, not fake-quant on B300.
+1. ~~Update PLAN.md: drop 2B distillation phases, reflect train-then-compress.~~ Done.
+2. ~~Run **FP8 gate eval** on H100~~ — **Done.** FP8 0.836 m < 1.0 m gate.
 3. Set up Alpagym RL pipeline with bf16 10B checkpoint (converted to Alpagym
    format via `convert_release_config_to_training.py`).
 4. RL training in Alpagym (bf16, `traj_future` path, GRPO with AlpaSim).
@@ -458,6 +455,66 @@ nvfp4-eval/scripts/generate_figures.py
 ```
 
 Outputs: `results/per_clip_100.csv`, `figures/*.png`. Wall time ~33 min on B300.
+
+---
+
+## 2026-07-02 — FP8 gate evaluation (H100)
+
+### Execution summary
+
+Ran on **1× NVIDIA H100 PCIe** via `fp8-eval/scripts/run_fp8_gate.sh`. Total wall
+time ~1 hr 7 min (quant ~27 min, bf16 eval ~18 min, FP8 eval ~21 min).
+
+| Step | Status | Notes |
+|------|--------|-------|
+| FP8 quantization (100 calib clips) | Done | output `outputs/alpamayo1.5_fp8_calib100` (~11 GB) |
+| bf16 baseline eval (100 clips) | Done | 100/100 succeeded |
+| FP8 eval (100 clips) | Done | 100/100 succeeded |
+
+Same parquets and settings as NVFP4 gate (`num_traj_samples=6`, `seed=42`).
+
+### Results (100 clips — H100)
+
+| Metric | bf16 | FP8 | Δ |
+|--------|------|-----|---|
+| **mean minADE** | **0.854 m** | **0.836 m** | −0.018 m (−2.1%) |
+| **avg time/clip** | 2,582 ms | 5,329 ms | 2.1× slower |
+| clips succeeded | 100/100 | 100/100 | — |
+
+Full summary: `fp8-eval/results/summary.json`. Logs: `fp8-eval/logs/`.
+
+**Gate: PASSED** — FP8 mean minADE **0.836 m** < **1.0 m** threshold (164 m margin).
+
+### Comparison to NVFP4 gate (B300, 100 clips)
+
+| Format | mean minADE | avg time/clip | Hardware |
+|--------|-------------|---------------|----------|
+| bf16 | 0.817 m | 1,400 ms | B300 |
+| NVFP4 | 0.848 m | 4,380 ms | B300 |
+| bf16 | 0.854 m | 2,582 ms | H100 |
+| **FP8** | **0.836 m** | **5,329 ms** | **H100** |
+
+H100 bf16 baseline (0.854 m) is ~4.5% higher than B300 bf16 (0.817 m) — likely
+run variance, not a hardware quality difference. FP8 (0.836 m) sits between the
+two bf16 baselines and is slightly better than NVFP4 (0.848 m), consistent with
+8-bit being less aggressive than 4-bit.
+
+On this paired H100 run, FP8 is marginally *better* than bf16 (−2.1%); treat as
+noise (same caveat as NVFP4 paired t-test p=0.57 at N=100).
+
+### Latency caveat
+
+Logs show `RealQuantLinear: No real-quant GEMM found` on every layer during FP8
+eval — ModelOpt fake-quant path, same as NVFP4 on B300. The 5.3 s/clip FP8
+latency and 2.1× slowdown vs bf16 are **not** representative of optimized
+Hopper FP8 kernels. Still far above the 0.1 s `drive()` budget; kernel tuning /
+TensorRT / `traj_future` path required before deployment.
+
+### Decision
+
+**Both quantization gates passed.** Train-then-compress pipeline confirmed:
+RL on bf16 10B in Alpagym → FP8 PTQ for Hopper deployment. Proceed to Phase 1
+(Alpagym RL setup).
 
 ---
 
@@ -530,8 +587,8 @@ Use the journal as source material; expand each item for external readers.
   serves as a worst-case bound (4-bit > 8-bit degradation).
 - [x] **Sample size** — 100-clip eval done; 10-clip gate was directional only.
   Remaining gap vs full 644-clip benchmark noted.
-- [ ] **FP8 not yet evaluated** — must run before RL to confirm deployment
-  quantization quality. Can run on H100 (Brev `hyperstack_H100` at $2.28/hr).
+- [x] **FP8 evaluated on H100** — mean minADE 0.836 m (< 1.0 m gate). See
+  2026-07-02 FP8 gate section. Fake-quant latency still needs optimization.
 
 ### Decision & downstream implications
 

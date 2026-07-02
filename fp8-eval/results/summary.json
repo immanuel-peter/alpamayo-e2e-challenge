@@ -1,0 +1,52 @@
+{
+  "gate_threshold_minade_m": 1.0,
+  "gate_passed": true,
+  "hardware": "1x NVIDIA H100 PCIe",
+  "primary_eval": {
+    "label": "100-clip FP8 gate (H100)",
+    "n_clips": 100,
+    "n_total_in_parquet": 644,
+    "eval_parquet": "1005_7cam_gold_eval_metadb_public.parquet",
+    "calib_parquet": "0417_5k_train_set_for_calibration_25.10.parquet",
+    "calib_clips": 100,
+    "settings": {
+      "num_traj_samples": 6,
+      "seed": 42,
+      "print_every": 25
+    },
+    "artifacts": {
+      "bf16_log": "logs/bf16_eval_100.log",
+      "fp8_log": "logs/fp8_eval_100.log",
+      "quantize_log": "logs/quantize_fp8_calib100.log",
+      "fp8_checkpoint": "alpamayo-recipes/recipes/alpamayo1_5_quant/outputs/alpamayo1.5_fp8_calib100"
+    },
+    "bf16": {
+      "checkpoint": "nvidia/Alpamayo-1.5-10B",
+      "avg_minade_m": 0.854103,
+      "avg_time_ms": 2581.89,
+      "clips_succeeded": 100,
+      "clips_failed": 0
+    },
+    "fp8": {
+      "checkpoint": "outputs/alpamayo1.5_fp8_calib100",
+      "checkpoint_size_gb": 11,
+      "avg_minade_m": 0.836417,
+      "avg_time_ms": 5328.61,
+      "clips_succeeded": 100,
+      "clips_failed": 0
+    },
+    "delta": {
+      "minade_m": -0.017686,
+      "minade_pct": -2.07,
+      "latency_ratio": 2.06
+    },
+    "gate_margin_m": 0.163583,
+    "quantize_wall_time_min": 27
+  },
+  "nvfp4_reference_b300": {
+    "bf16_avg_minade_m": 0.817135,
+    "nvfp4_avg_minade_m": 0.847516,
+    "note": "B300 run; FP8 H100 minADE (0.836) sits between B300 bf16 and NVFP4. H100 bf16 baseline (0.854) is ~4.5% higher than B300 bf16 — likely run/hardware variance, not quant effect."
+  },
+  "writeup_headline": "On 100 held-out PAI gold eval clips on H100, FP8 mean minADE is 0.836 m (under 1.0 m gate), vs bf16 0.854 m on the same machine (+2.1% quant penalty not seen — within noise). FP8 inference is 2.1× slower than bf16 on H100 (5.3 s vs 2.6 s/clip)."
+}
