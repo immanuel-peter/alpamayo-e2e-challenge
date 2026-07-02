@@ -1,0 +1,105 @@
+{
+  "gate_threshold_minade_m": 1.0,
+  "gate_passed": true,
+  "primary_eval": {
+    "label": "100-clip (writeup headline numbers)",
+    "n_clips": 100,
+    "n_total_in_parquet": 644,
+    "source": "verbose re-run with --print_every 1",
+    "artifacts": {
+      "per_clip_csv": "results/per_clip_100.csv",
+      "bf16_log": "logs/bf16_verbose_100.log",
+      "nvfp4_log": "logs/nvfp4_verbose_100.log"
+    },
+    "bf16": {
+      "checkpoint": "nvidia/Alpamayo-1.5-10B",
+      "avg_minade_m": 0.817135,
+      "median_minade_m": 0.4800,
+      "std_minade_m": 1.1526,
+      "min_minade_m": 0.0312,
+      "max_minade_m": 9.5179,
+      "p95_minade_m": 2.6172,
+      "avg_time_ms": 1400.0,
+      "clips_succeeded": 100,
+      "clips_failed": 0,
+      "clips_under_gate": 78
+    },
+    "nvfp4": {
+      "checkpoint": "outputs/alpamayo1.5_nvfp4_calib100",
+      "avg_minade_m": 0.847516,
+      "median_minade_m": 0.5264,
+      "std_minade_m": 1.1608,
+      "min_minade_m": 0.0797,
+      "max_minade_m": 9.5093,
+      "p95_minade_m": 2.5607,
+      "avg_time_ms": 4380.4,
+      "clips_succeeded": 100,
+      "clips_failed": 0,
+      "clips_under_gate": 79
+    },
+    "delta": {
+      "minade_m": 0.030381,
+      "minade_pct": 3.72,
+      "mean_abs_minade_m": 0.2787,
+      "latency_ratio": 3.13,
+      "nvfp4_better_clips": 42,
+      "nvfp4_worse_clips": 58,
+      "pearson_r": 0.8961,
+      "paired_ttest_p": 0.5678,
+      "bootstrap_95ci_mean_delta_m": [-0.2887, 0.3541]
+    },
+    "gate_breakdown": {
+      "both_pass": 75,
+      "both_fail": 18,
+      "bf16_pass_nvfp4_fail": 3,
+      "bf16_fail_nvfp4_pass": 4
+    },
+    "gate_margin_m": 0.152484,
+    "notable_clips": {
+      "worst_nvfp4_regression": {
+        "clip_id": "7b026836-2af6-42ce-8485-8a1b52ba1fb0",
+        "bf16_m": 1.022,
+        "nvfp4_m": 3.724,
+        "delta_m": 2.702
+      },
+      "best_nvfp4_improvement": {
+        "clip_id": "fc70ddaa-ea3b-47d5-b51d-fe1a3049216c",
+        "bf16_m": 3.511,
+        "nvfp4_m": 0.506,
+        "delta_m": -3.005
+      }
+    }
+  },
+  "smoke_eval": {
+    "label": "10-clip (fast gate only — easier clip subset)",
+    "n_clips": 10,
+    "bf16": {
+      "avg_minade_m": 0.617714,
+      "avg_time_ms": 1546.54
+    },
+    "nvfp4": {
+      "avg_minade_m": 0.646489,
+      "avg_time_ms": 4204.90
+    },
+    "delta": {
+      "minade_m": 0.028775,
+      "minade_pct": 4.66,
+      "latency_ratio": 2.72
+    },
+    "note": "Absolute minADE ~32% lower than 100-clip mean; relative NVFP4 penalty ~4% in both."
+  },
+  "running_avg_checkpoints_100": [
+    {"clips": 25, "bf16_avg_so_far_m": 0.8591, "nvfp4_avg_so_far_m": 0.8602},
+    {"clips": 50, "bf16_avg_so_far_m": 0.6995, "nvfp4_avg_so_far_m": 0.7813},
+    {"clips": 75, "bf16_avg_so_far_m": 0.8634, "nvfp4_avg_so_far_m": 0.8647},
+    {"clips": 100, "bf16_avg_so_far_m": 0.8171, "nvfp4_avg_so_far_m": 0.8475}
+  ],
+  "figures": [
+    "figures/minade_scatter_100.png",
+    "figures/minade_scatter_100_full.png",
+    "figures/latency_comparison.png",
+    "figures/gate_breakdown_100.png",
+    "figures/delta_histogram_100.png"
+  ],
+  "writeup_headline": "On 100 held-out PAI gold eval clips, NVFP4 increases mean minADE by 3.7% (0.817 → 0.848 m), remaining under our 1.0 m gate. The shift is not statistically significant (paired t-test p=0.57); per-clip errors correlate strongly (r=0.90)."
+}

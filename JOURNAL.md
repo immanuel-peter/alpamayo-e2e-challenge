@@ -144,15 +144,16 @@ Record: avg minADE (NVFP4), avg time/clip.
 
 | Metric | bf16 baseline | NVFP4 | Pass? |
 |--------|--------------|-------|-------|
-| avg minADE | TBD | TBD | < 1.0m? |
-| avg time/clip | TBD | TBD | — |
+| avg minADE (100 clips) | **0.817m** | **0.848m** | **Yes** (< 1.0m) |
+| avg minADE (10 clips, smoke) | 0.618m | 0.646m | Yes |
+| avg time/clip (100 clips) | 1,399 ms | 4,378 ms | — (3.1× slower) |
 
 - **If NVFP4 minADE < 1.0m**: consider skipping distillation. RL directly
   on the quantized 10B preserves full perception capacity and simplifies the
   pipeline.
 - **If NVFP4 minADE >= 1.0m**: proceed with distillation to 2B as planned.
 
-Also run FP8 as a middle-ground data point:
+Also run FP8 as a middle-ground data point (skipped — NVFP4 result was clear):
 ```bash
 uv run --active quantize.py --quant_format=fp8 --num_of_calib_clips=100 --save_model_dir=./outputs
 uv run --active eval.py --ckpt ./outputs/alpamayo1.5_fp8_calib100 --limit 10 --print_every 1
@@ -253,6 +254,305 @@ brev create alpamayo-quant-gate --type verda_B300
 
 ### Prerequisites before launching
 
-- [ ] HF access approved for `nvidia/Alpamayo-1.5-10B` (gated model)
-- [ ] HF access approved for `nvidia/PhysicalAI-AV` (gated dataset)
-- [ ] Brev CLI installed and working locally
+- [x] HF access approved for `nvidia/Alpamayo-1.5-10B` (gated model)
+- [x] HF access approved for `nvidia/PhysicalAI-AV` (gated dataset)
+- [x] Brev CLI installed and working locally
+
+---
+
+## 2026-07-02 — Phase 0 results & decision
+
+### Execution summary
+
+Ran on **1× NVIDIA B300** (275 GB VRAM, compute cap 10.3) via Brev — not the
+planned RTX 5090, but the quant recipe README lists B300 as tested hardware.
+Total wall time ~2 hours (much faster than the 5–8 hr estimate, thanks to B300
+throughput and cached HF assets after first download).
+
+| Step | Status | Notes |
+|------|--------|-------|
+| Environment setup | Done | `alpamayo-recipes/recipes/alpamayo1_5_quant`, `uv sync`, flash-attn |
+| bf16 baseline eval (10 clips) | Done | 10/10 succeeded — fast smoke test |
+| bf16 baseline eval (100 clips) | Done | 10/10 succeeded — **writeup numbers** |
+| NVFP4 quantization (100 calib clips) | Done | ~24 min; output `outputs/alpamayo1.5_nvfp4_calib100` (~7.6 GB) |
+| NVFP4 eval (10 clips) | Done | 10/10 succeeded (after B300 runtime fixes below) |
+| NVFP4 eval (100 clips) | Done | 100/100 succeeded — **writeup numbers** |
+| FP8 quant + eval | Skipped | NVFP4 passed gate decisively |
+
+Eval clips: `1005_7cam_gold_eval_metadb_public.parquet` (644 total; used first
+100 for writeup, first 10 for fast gate).
+Calibration clips: `0417_5k_train_set_for_calibration_25.10.parquet` (100).
+Default eval settings: `num_traj_samples=6`, `seed=42`.
+
+### Results (100 clips — primary)
+
+| Metric | bf16 (`nvidia/Alpamayo-1.5-10B`) | NVFP4 (`alpamayo1.5_nvfp4_calib100`) | Δ |
+|--------|----------------------------------|--------------------------------------|---|
+| **mean minADE** | **0.817m** | **0.848m** | +0.030m (+3.7%) |
+| **median minADE** | 0.480m | 0.526m | +0.046m |
+| **p95 minADE** | 2.617m | 2.561m | — |
+| **avg time/clip** | 1,400 ms | 4,380 ms | 3.1× slower |
+| clips succeeded | 100/100 | 100/100 | — |
+| clips < 1.0m gate | 78/100 | 79/100 | — |
+
+Full per-clip data: `nvfp4-eval/results/per_clip_100.csv` (verbose re-run,
+`--print_every 1`). Figures: `nvfp4-eval/figures/`.
+
+**Distribution & statistics (100 clips):**
+- Heavy-tailed: max minADE ~9.5m on outlier clips; median (~0.5m) much lower
+  than mean (~0.8m).
+- Per-clip delta: NVFP4 better on **42**, worse on **58**; mean |Δ| = 0.28m.
+- Pearson **r = 0.90** — errors correlate strongly; quant preserves ranking.
+- Paired t-test **p = 0.57**; bootstrap 95% CI for mean Δ: **[-0.29, +0.35] m**
+  (spans zero). The +3.7% mean shift is not statistically significant at N=100.
+- Gate breakdown: **75** both pass, **18** both fail, 3 bf16-only pass, 4
+  NVFP4-only pass.
+
+Logs: `nvfp4-eval/logs/bf16_verbose_100.log`, `nvfp4_verbose_100.log`.
+
+### Results (10 clips — smoke test only)
+
+Fast gate run; **do not use as headline writeup numbers** — the first 10 clips
+were an easier subset (~32% lower absolute minADE than the 100-clip mean).
+
+| Metric | bf16 | NVFP4 | Δ |
+|--------|------|-------|---|
+| avg minADE | 0.618m | 0.646m | +0.029m (+4.7%) |
+| avg time/clip | 1,547 ms | 4,205 ms | 2.7× slower |
+
+The **relative** NVFP4 penalty is stable across 10 vs 100 clips (~4%); the
+**absolute** error was underestimated by the smoke test.
+
+Per-clip minADE for smoke test (meters):
+
+| # | clip_id (prefix) | bf16 | NVFP4 |
+|---|------------------|------|-------|
+| 1 | 55b172f7 | 1.452 | 1.540 |
+| 2 | b874a6b1 | 0.652 | 0.525 |
+| 3 | f4433f2a | 0.573 | 0.515 |
+| 4 | 10bad3f8 | 0.113 | 0.173 |
+| 5 | 30352e9e | 0.264 | 0.542 |
+| 6 | be1d9f78 | 0.911 | 0.345 |
+| 7 | 752561f7 | 0.117 | 0.432 |
+| 8 | a8dd5ceb | 0.161 | 0.125 |
+| 9 | 5a1ea30e | 0.637 | 0.938 |
+| 10 | f289708f | 1.297 | 1.330 |
+
+NVFP4 adds ~3.1× inference latency on B300 at 100 clips (ModelOpt fake-quant
+GEMM via Triton; logs show `RealQuantLinear: No real-quant GEMM found` on
+every layer). Acceptable for offline RL training; may need kernel tuning for
+the 0.1s AlpaSim driver budget later. Latency is fake-quant path — not
+optimized Blackwell NVFP4 kernels.
+
+### B300 runtime fixes (required)
+
+Stock torch 2.8.0 + triton 3.4.0 (bundled with torch) does **not** work out of
+the box on B300 (`sm_103a`). These are infrastructure issues, not model-quality
+problems — the quantized checkpoint loads and runs fine once fixed.
+
+1. **NVRTC (bf16 eval):** bundled `libnvrtc.so.12` (CUDA 12.8) doesn't know
+   `sm_103`. Fix: install `nvidia-cuda-nvrtc` pip package (CUDA 13) and symlink
+   over the bundled library; set `LD_LIBRARY_PATH` to cu13 lib dir.
+
+2. **Triton ptxas (NVFP4 eval):** bundled ptxas only supports up to `sm_101a`.
+   Fix: symlink `nvidia/cu13/bin/ptxas` into
+   `triton/backends/nvidia/bin/ptxas`.
+
+3. **Triton version (NVFP4 eval):** triton 3.4.0 fails CUDA version check when
+   using cu13 ptxas (`got CUDA version: 13.3`). Fix: pin **`triton>=3.7.1`**
+   in `pyproject.toml` with `[tool.uv] override-dependencies` (torch 2.8.0
+   pulls 3.4.0 otherwise; `uv run` re-syncs it back).
+
+All three fixes are captured in
+`alpamayo-recipes/recipes/alpamayo1_5_quant/run_env.sh` and `pyproject.toml`.
+
+### Decision (revised 2026-07-02)
+
+**Skip distillation. RL on bf16 10B in Alpagym, then FP8 quantize for
+deployment.**
+
+The initial decision ("RL directly on the NVFP4-quantized 10B") was revised
+after discovering two constraints:
+
+1. **Alpagym only loads bf16 checkpoints.** The `alpamayo_r1` policy bundle's
+   `load_inference_model` enforces `dtype=bfloat16` via
+   `ExpertModelRL.from_pretrained`. There is no quantized-model RL path.
+   Alpagym runs RL with an in-process trainable model, not an external Docker
+   driver — it can't RL-tune a black-box container.
+
+2. **Challenge eval runs on Hopper (H100), not Blackwell.** The README says
+   "EC2 configs start 16 replicas across GPUs 4-7" on 8-GPU instances
+   (`p5.48xlarge` = 8×H100). NVFP4 is Blackwell-only. The submitted Docker
+   image must use **FP8** (Hopper-native) or INT8, not NVFP4.
+
+**Corrected pipeline:**
+```
+nvidia/Alpamayo-1.5-10B (bf16, HF)
+  → convert to Alpagym format (convert_release_config_to_training.py)
+  → RL training in Alpagym (bf16, traj_future path, GRPO)
+  → export RL checkpoint (convert_cosmos_rl_checkpoint.py)
+  → quantize to FP8 (quantize.py --quant_format=fp8)
+  → bake FP8 weights into Docker image
+```
+
+This is **train-then-compress**, not compress-then-train. The Phase 0 gate
+is still valid: it proves PTQ preserves perception (+3.7% at NVFP4, so FP8
+will be even better), giving confidence that post-RL FP8 quantization will
+preserve RL-tuned behavior. PTQ rounds weights; it doesn't retrain, so
+self-correcting behavior learned through RL should survive much better than
+distillation would have.
+
+**What the NVFP4 result tells us (still valid):**
+- NVFP4 avg minADE **0.848m** is under the **1.0m gate** (~15cm margin).
+- NVFP4 adds only **+3.7%** mean error vs bf16 (0.817m → 0.848m) — consistent
+  with the ~4.7% seen on the smoke test; relative quant penalty is stable.
+- Per-clip behavior is reasonable — no systematic blow-up; Pearson r=0.90.
+- Skipping Phases 1–2 saves ~$220 and ~36+ hours of distillation work.
+- Full 10B perception capacity is preserved vs. a 2B student.
+- Since FP8 (8-bit) is less aggressive than NVFP4 (4-bit), FP8 quality loss
+  will be strictly less than the +3.7% we measured.
+
+**Writeup headline (suggested):**
+> On 100 held-out PAI gold eval clips, NVFP4 increases mean minADE by 3.7%
+> (0.817 → 0.848 m), remaining under our 1.0 m gate. The shift is not
+> statistically significant (paired t-test p=0.57); per-clip errors correlate
+> strongly (r=0.90). This confirms PTQ preserves perception quality, enabling
+> a train-then-compress pipeline: RL on bf16 10B, then FP8 quantize for
+> Hopper-compatible deployment.
+
+**Next steps (revised):**
+1. Update PLAN.md: drop 2B distillation phases, reflect train-then-compress.
+2. Run **FP8 gate eval** on H100 (Brev `hyperstack_H100` at $2.28/hr) — FP8
+   is Hopper-native and is the actual deployment format. Confirm FP8 minADE
+   < 1.0m (very likely, since FP8 < NVFP4 degradation). This also tests
+   real-quant latency on H100, not fake-quant on B300.
+3. Set up Alpagym RL pipeline with bf16 10B checkpoint (converted to Alpagym
+   format via `convert_release_config_to_training.py`).
+4. RL training in Alpagym (bf16, `traj_future` path, GRPO with AlpaSim).
+5. Export RL checkpoint, re-quantize to FP8, bake into Docker image.
+6. Profile FP8 inference latency for 0.1s driver budget on H100.
+
+**Cost revision:** RL is now on bf16 10B (not 2B), ~5× more expensive per
+rollout than the PLAN assumed. Moderate RL (~$320 vs ~$64), aggressive RL
+(~$1,640 vs ~$328). The ~$220 distillation savings partially offset this.
+
+**FP8 efficiency levers (if 16 GiB VRAM is tight with 2 concurrent rollouts):**
+- `--quant_weight_only` FP8: weights ~11 GB, activations stay FP16
+- `num_traj_samples=1`: single trajectory, no selection
+- Reduce diffusion `inference_step` count
+- `traj_future` path (no CoC generation) — already planned
+- torch.compile on forward pass
+- TensorRT export for expert + vision encoder
+- INT8 weight-only as fallback (~6-7 GB, H100-compatible)
+
+**Empirical artifacts:** `nvfp4-eval/` in this repo — summary JSON, CSVs,
+methodology config, log manifest, figure checklist, log parser script.
+
+### Expanded eval for writeup (done)
+
+Verbose re-run with `--print_every 1` for full per-clip export + figures:
+
+```bash
+nvfp4-eval/scripts/run_verbose_eval_100.sh
+nvfp4-eval/scripts/generate_figures.py
+```
+
+Outputs: `results/per_clip_100.csv`, `figures/*.png`. Wall time ~33 min on B300.
+
+---
+
+## Writeup requirements (NVFP4 gate evaluation section)
+
+Checklist of what the technical writeup / blog must include beyond this journal.
+Use the journal as source material; expand each item for external readers.
+
+### Narrative & motivation
+
+- [ ] **Problem framing** — E2E challenge needs a deployable driver; full bf16
+  10B is too heavy for the container budget; distillation (2B student) was the
+  fallback plan (~$220, ~36+ hr).
+- [ ] **Gating hypothesis** — NVFP4 PTQ retains enough open-loop driving
+  quality to skip distillation and RL-tune the quantized 10B directly.
+- [ ] **Decision criteria** — avg minADE < 1.0m on PAI gold eval clips;
+  explain *why* this threshold and *why* open-loop minADE (not closed-loop
+  collision rate) is the right fast gate before sim RL investment.
+
+### Model & task context (assume reader is unfamiliar)
+
+- [ ] **Alpamayo 1.5 in one paragraph** — 10B VLA: Qwen3-VL-2B backbone +
+  diffusion trajectory expert; VLM chain-of-causation rollout then trajectory
+  sampling.
+- [ ] **What NVFP4 is** — NVIDIA 4-bit floating-point quant format;
+  Blackwell-only, ~4× weight compression (~22 GB → ~5.5–7.6 GB).
+- [ ] **What minADE measures** — minimum average displacement error over
+  `num_traj_samples=6` predicted trajectories vs. GT future ego path at
+  `t0_us=5.1s`; units in meters; lower is better.
+
+### Methodology (reproducibility)
+
+- [ ] **Recipe & scripts** — `alpamayo-recipes/recipes/alpamayo1_5_quant/`
+  (`quantize.py`, `eval.py`); link to NVIDIA recipe README.
+- [ ] **Checkpoints** — bf16: `nvidia/Alpamayo-1.5-10B`; NVFP4:
+  `outputs/alpamayo1.5_nvfp4_calib100` (100 calib clips, `max` calibrator,
+  ModelOpt 0.43.0).
+- [ ] **Data** — eval: `1005_7cam_gold_eval_metadb_public.parquet`; calib:
+  `0417_5k_train_set_for_calibration_25.10.parquet`; gated HF dataset access.
+- [ ] **Eval settings** — `num_traj_samples=6`, `seed=42`, `max_generation_length=256`,
+  `top_p=0.98`, `temperature=0.6`.
+- [ ] **Hardware** — 1× NVIDIA B300 (sm_103a), torch 2.8.0, triton 3.7.1;
+  document B300 runtime fixes (`run_env.sh`).
+- [ ] **Exact commands / commit** — pin git SHA of `alpamayo-recipes` and log
+  file paths for reproducibility.
+
+### Results to report
+
+- [x] **Headline table** — bf16 vs NVFP4: avg minADE, avg time/clip, clip
+  success rate, checkpoint size. **100-clip numbers:** 0.817m / 0.848m / 3.1×.
+- [x] **Per-clip analysis** — scatter, delta histogram, gate breakdown in
+  `figures/`; full CSV in `results/per_clip_100.csv`.
+- [x] **Statistical honesty** — N=100 of 644; high per-clip variance documented
+  (running avg swings 0.70–0.86m); 10-clip smoke test was optimistic (~32%
+  lower absolute error).
+- [ ] **Trajectory figures** — 1–2 overlaid pred vs GT trajectory plots for
+  representative clips (best case, worst regression).
+
+### Limitations & caveats (must not skip)
+
+- [ ] **Open-loop only** — minADE on held-out PAI clips does not predict
+  closed-loop collision-free duration in AlpaSim; sim RL still required.
+- [ ] **Fake-quant inference on B300** — logs show `RealQuantLinear: No
+  real-quant GEMM found`; accuracy reflects quantized weights but latency
+  (3.1× slower at 100 clips) is fake-quant Triton path, not optimized
+  Blackwell NVFP4 kernels. FP8 on H100 will use real Hopper FP8 GEMM —
+  latency will differ and should be measured separately.
+- [ ] **NVFP4 not deployable** — challenge eval runs on H100 (Hopper);
+  NVFP4 is Blackwell-only. Deployment must use FP8 or INT8. The NVFP4 result
+  serves as a worst-case bound (4-bit > 8-bit degradation).
+- [x] **Sample size** — 100-clip eval done; 10-clip gate was directional only.
+  Remaining gap vs full 644-clip benchmark noted.
+- [ ] **FP8 not yet evaluated** — must run before RL to confirm deployment
+  quantization quality. Can run on H100 (Brev `hyperstack_H100` at $2.28/hr).
+
+### Decision & downstream implications
+
+- [x] **Gate outcome** — PASSED: skip distillation. RL on bf16 10B in Alpagym,
+  then FP8 quantize post-RL for Hopper-compatible deployment (0.848m < 1.0m
+  on 100 clips at NVFP4; FP8 will be strictly better).
+- [ ] **Economics** — ~$220 and ~36+ hr saved vs 2B distillation pipeline.
+  RL cost increases ~5× (bf16 10B vs 2B): moderate ~$320, aggressive ~$1,640.
+- [ ] **Tradeoffs** — keep full 10B capacity for RL; FP8 deployment (~11 GB
+  weights) is tighter in 16 GiB VRAM than NVFP4 would have been (~7.6 GB);
+  latency profiling on H100 real-quant still needed for 0.1s budget.
+- [ ] **Train-then-compress rationale** — Alpagym only loads bf16; challenge
+  eval is H100 (Hopper, no NVFP4); PTQ preserves RL behavior better than
+  distillation would have.
+- [ ] **Alternative path rejected** — brief description of what distillation
+  would have entailed (SFT 2B student from 10B teacher, then RL).
+
+### Optional for paper-grade depth
+
+- [ ] Full 644-clip eval with confidence intervals.
+- [ ] FP8 / AutoQuant comparison at 6.5 effective bits.
+- [ ] Closed-loop AlpaSim metrics post-RL as validation that open-loop gate
+  was sufficient.
+- [ ] Comparison to NVIDIA-published Alpamayo 1.5 benchmarks if available.

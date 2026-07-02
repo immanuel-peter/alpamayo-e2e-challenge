@@ -1,0 +1,80 @@
+{
+  "experiment": "nvfp4_gate_eval",
+  "date": "2026-07-02",
+  "decision": "skip_distillation_rl_on_nvfp4_10b",
+  "gate_threshold_minade_m": 1.0,
+  "recipe": {
+    "repo": "alpamayo-recipes",
+    "path": "recipes/alpamayo1_5_quant",
+    "scripts": ["quantize.py", "eval.py"],
+    "git_sha": "da87c26919caa4ee4b1a339373a1b0f7ab8bf143"
+  },
+  "challenge_repo_git_sha": "c81b4a40cdb7080bb94aa831f5906e831bed307b",
+  "checkpoints": {
+    "bf16": {
+      "hub_id": "nvidia/Alpamayo-1.5-10B",
+      "dtype": "float16",
+      "size_gb_approx": 22
+    },
+    "nvfp4": {
+      "path": "alpamayo-recipes/recipes/alpamayo1_5_quant/outputs/alpamayo1.5_nvfp4_calib100",
+      "quant_format": "nvfp4",
+      "calib_clips": 100,
+      "calib_parquet": "0417_5k_train_set_for_calibration_25.10.parquet",
+      "calibrator": "max",
+      "modelopt_version": "0.43.0",
+      "size_gb_approx": 7.6
+    }
+  },
+  "dataset": {
+    "eval_parquet": "1005_7cam_gold_eval_metadb_public.parquet",
+    "eval_parquet_total_clips": 644,
+    "eval_clips_used": 100,
+    "eval_clip_selection": "first N from parquet order",
+    "hf_dataset": "nvidia/PhysicalAI-Autonomous-Vehicles",
+    "gated": true
+  },
+  "eval_settings": {
+    "t0_us": 5100000,
+    "num_traj_samples": 6,
+    "max_generation_length": 256,
+    "top_p": 0.98,
+    "temperature": 0.6,
+    "seed": 42,
+    "metric": "minADE",
+    "metric_description": "min over num_traj_samples of mean L2 xy error vs GT future ego path (meters)"
+  },
+  "hardware": {
+    "gpu": "NVIDIA B300 SXM6 AC",
+    "vram_gb": 275,
+    "compute_capability": "10.3",
+    "driver": "580.126.09",
+    "cuda": "13.0 (driver) / 12.8 (torch cu128 bundle)"
+  },
+  "software": {
+    "python": "3.12",
+    "torch": "2.8.0+cu128",
+    "triton": "3.7.1",
+    "nvidia_modelopt": "0.43.0",
+    "env_script": "alpamayo-recipes/recipes/alpamayo1_5_quant/run_env.sh",
+    "b300_fixes": [
+      "nvidia-cuda-nvrtc cu13 symlink for NVRTC sm_103",
+      "nvidia/cu13 ptxas symlink for Triton sm_103a",
+      "triton>=3.7.1 pinned in pyproject.toml override-dependencies"
+    ]
+  },
+  "runs": {
+    "smoke_10": {
+      "limit": 10,
+      "print_every": 1,
+      "bf16_log": "alpamayo-recipes/recipes/alpamayo1_5_quant/baseline_eval_v2.log",
+      "nvfp4_log": "alpamayo-recipes/recipes/alpamayo1_5_quant/nvfp4_eval_v6.log"
+    },
+    "primary_100": {
+      "limit": 100,
+      "print_every": 25,
+      "bf16_log": "alpamayo-recipes/recipes/alpamayo1_5_quant/baseline_eval_100.log",
+      "nvfp4_log": "alpamayo-recipes/recipes/alpamayo1_5_quant/nvfp4_eval_100.log"
+    }
+  }
+}

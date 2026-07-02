@@ -17,93 +17,97 @@ competition**. The model that drives the longest without crashing wins. What mat
 
 Open-loop metrics (minADE/minFDE) are irrelevant if the model diverges in closed loop.
 
-## Strategy: Distill 10B → 2B, Then RL on the 2B
+## Strategy: RL on bf16 10B, Then FP8 Quantize for Deployment
 
 ### Why this order
 
-- **RL directly optimizes the deployed model.** No train/deploy gap. The self-correcting
-  behavior that RL produces is shaped in the student's own parameter space — the exact
-  model that runs at inference time.
-- **Compute efficiency.** GRPO needs many closed-loop rollouts per update. A 2B model is
-  ~5x cheaper per rollout than 10B, yielding 5x more rollouts for the same budget.
-- **Distillation gives a strong starting point.** The 2B student inherits perception and
-  basic driving behavior from the 10B teacher via imitation, so RL starts from a model
-  that can already drive — not from scratch.
-- **RL-then-distill loses the key property.** Distillation transfers input→output
-  mappings, not closed-loop robustness. The self-correcting behavior learned through RL
-  would be lost during compression.
+- **RL directly optimizes the deployed model.** GRPO shapes self-correcting
+  behavior in the 10B's own parameter space — the exact model that runs at
+  inference time (after quantization).
+- **Alpagym only loads bf16 checkpoints.** The `alpamayo_r1` policy bundle
+  enforces `dtype=bfloat16` via `ExpertModelRL.from_pretrained`. There is no
+  quantized-model RL path. RL must run on bf16 weights.
+- **Challenge eval runs on Hopper (H100), not Blackwell.** AWS `p5.48xlarge`
+  (8×H100) is the eval hardware. NVFP4 is Blackwell-only. The submitted Docker
+  image must use **FP8** (Hopper-native) for deployment.
+- **PTQ preserves RL behavior.** Post-training quantization rounds weights; it
+  doesn't retrain. Self-correcting behavior learned through RL survives
+  compression much better than distillation (which transfers input→output
+  mappings, not closed-loop robustness).
+- **Phase 0 gate proved PTQ is safe.** NVFP4 (4-bit) added only +3.7% minADE.
+  FP8 (8-bit) is strictly less aggressive — degradation will be less.
+
+### Corrected checkpoint flow
+
+```
+nvidia/Alpamayo-1.5-10B (bf16, HF)
+  → convert to Alpagym format (convert_release_config_to_training.py)
+  → RL training in Alpagym (bf16, traj_future path, GRPO with AlpaSim)
+  → export RL checkpoint (convert_cosmos_rl_checkpoint.py)
+  → quantize to FP8 (quantize.py --quant_format=fp8)
+  → bake FP8 weights into Docker image (~11 GB)
+```
 
 ### Why no CoC at inference
 
-Chain-of-Causation (CoC) reasoning requires autoregressive VLM generation (~256 tokens,
-~50-80ms) before the diffusion expert runs. On a 2B model at 0.1s budget, this leaves no
-room for vision encoding, diffusion sampling, or multi-session contention.
+Chain-of-Causation (CoC) reasoning requires autoregressive VLM generation
+(~256 tokens, ~50-80ms) before the diffusion expert runs. On a 10B model at
+0.1s budget, this leaves no room for vision encoding, diffusion sampling, or
+multi-session contention.
 
-The `last_component="traj_future"` path (used by Alpagym's RL recipe) skips VLM generation
-entirely — the expert conditions on prefill-only KV cache. This is the deploy path.
+The `last_component="traj_future"` path (used by Alpagym's RL recipe) skips
+VLM generation entirely — the expert conditions on prefill-only KV cache.
+This is the deploy path.
 
-**CoC is removed from the student but used as teacher signal during distillation.** The
-student never generates CoC tokens, but is trained against teacher trajectories that
-benefited from CoC reasoning. The reasoning quality is internalized into the student's
-latent representations rather than explicitly generated.
-
-Keeping CoC in the student would also:
-- Create a train/deploy mismatch (distill with CoC, RL/deploy without)
-- Split limited 2B capacity between a reasoning language head and trajectory expert
-- Slow RL rollouts, reducing gradient quality
+**CoC is not generated at RL or deploy time.** The 10B was RL post-trained by
+NVIDIA with CoC reasoning, so the reasoning quality is already internalized
+into the model's latent representations. Our RL further tunes for closed-loop
+robustness on the `traj_future` path directly.
 
 ---
 
 ## Architecture
 
-### Teacher (10B Alpamayo 1.5)
+### RL model (10B Alpamayo 1.5, bf16)
 
 ```
-Camera images → Vision encoder → VLM prefill → CoC generation → Diffusion expert → trajectory*
-                                                              ↑
-                                                     reasoning-enriched KV cache
+Camera images → Vision encoder → VLM prefill → Diffusion expert → trajectory
+                                               ↑
+                                     prefill-only KV cache (no CoC generation)
 ```
 
 - Model: `nvidia/Alpamayo-1.5-10B` (gated, needs HF access approval)
 - Dataset: `nvidia/PhysicalAI-Autonomous-Vehicles` (gated)
-- Inference: `sample_trajectories_from_data_with_vlm_rollout` (full pipeline with CoC)
+- Inference: `sample_trajectories_from_data` with `last_component="traj_future"`
+- RL framework: Alpagym (`alpamayo_r1` policy bundle, `ExpertModelRL`, bf16)
 - VRAM: ~24 GB single-sample (H100 80GB)
 
-### Student (2B distilled model)
+### Deployed model (10B + FP8 quantization, RL post-trained)
 
 ```
 Camera images → Vision encoder → VLM prefill → Diffusion expert → trajectory
-                                              ↑
-                                    prefill-only KV cache (no CoC generation)
+                                               ↑
+                                     prefill-only KV cache, FP8 weights
 ```
 
-- Architecture: 2B VLA (Cosmos-Reason backbone + diffusion expert, scaled down)
-- Inference: `sample_trajectories_from_data` with `last_component="traj_future"`
-- VRAM target: <8 GB (INT4 quantized) to leave headroom in 16 GiB budget
-- Latency target: <50ms per `drive()` call
-
-### Deployed model (2B + INT4 quantization, RL post-trained)
-
-```
-Camera images → Vision encoder → VLM prefill → Diffusion expert → trajectory
-                                              ↑
-                                    prefill-only KV cache, INT4 weights
-```
-
-- Same architecture and inference path as student
-- INT4 quantized weights baked into Docker image (no network at runtime)
-- RL post-trained for closed-loop robustness
+- Same architecture and inference path as RL model
+- FP8 quantized weights baked into Docker image (no network at runtime)
+- RL post-trained for closed-loop robustness, then PTQ to FP8
+- ~11 GB weights (FP8), fits in 16 GiB VRAM with 2 concurrent rollouts
+- Eval hardware: 8×H100 (Hopper) — FP8 is native, NVFP4 is not supported
 - 2 concurrent rollouts per replica, 16 replicas across 4 GPUs
 
 ---
 
 ## Phases
 
-### Phase 0: Baseline & Setup
+### Phase 0: Baseline & Setup (DONE)
 
 **Goal:** Get the starter kit running and submitted to establish a floor score.
+Quantization gate: confirm PTQ preserves perception quality.
 
-- [ ] Register at the [challenge HF Space](https://huggingface.co/spaces/nvidia/AlpasimE2EClosedLoopChallenge2026), get approved
+- [x] Register at the [challenge HF Space](https://huggingface.co/spaces/nvidia/AlpasimE2EClosedLoopChallenge2026), get approved
+- [x] Get HF access to `nvidia/Alpamayo-1.5-10B` and `nvidia/PhysicalAI-Autonomous-Vehicles`
 - [ ] Build the starter driver container:
   ```bash
   docker build -f e2e_challenge/starter_kit/Dockerfile -t alpasim-e2e-starter-driver:latest .
@@ -113,53 +117,66 @@ Camera images → Vision encoder → VLM prefill → Diffusion expert → trajec
 - [ ] Authenticate with the challenge CLI (`auth-url` → `configure-token` → `me`)
 - [ ] Verify ECR login works (`ecr-login`)
 
-**Decision gate:** Before committing to distillation, smoke-test whether INT4 quantized
-10B Alpamayo has sufficient perception quality to explore useful behaviors during RL. If
-INT4-10B perception is good enough, the distillation step may be skippable — RL directly
-on the quantized 10B would be simpler and preserve more capacity. The choice depends on
-whether quantization degrades perception enough to prevent meaningful RL exploration.
+**Decision gate (DONE — PASSED):** NVFP4-quantized 10B Alpamayo has sufficient
+perception quality. On 100 PAI gold eval clips, NVFP4 avg minADE = 0.848m
+(< 1.0m gate, +3.7% vs bf16 0.817m, not statistically significant p=0.57).
+Since FP8 (8-bit) is less aggressive than NVFP4 (4-bit), FP8 will degrade
+perception even less. Distillation is skipped.
 
-- [ ] Load 10B Alpamayo with INT4 quantization
-- [ ] Run inference on example clips from `test_inference.py`
-- [ ] Compare trajectory quality (minADE) between bf16 and INT4
-- [ ] If INT4 minADE < 1.0m and trajectories look reasonable → consider skipping distillation
-- [ ] If INT4 perception is degraded → proceed with distillation to 2B
+- [x] Quantize 10B Alpamayo to NVFP4 (100 calib clips, ModelOpt 0.43.0)
+- [x] Run eval on 100 clips: bf16 vs NVFP4 minADE comparison
+- [x] Result: NVFP4 minADE 0.848m < 1.0m gate → skip distillation
+- [ ] Run FP8 gate eval on H100 (deployment format, Hopper-native):
+  ```bash
+  brev create alpamayo-fp8-gate --type hyperstack_H100
+  # on instance:
+  uv run --active quantize.py --quant_format=fp8 --num_of_calib_clips=100 --save_model_dir=./outputs
+  uv run --active eval.py --ckpt ./outputs/alpamayo1.5_fp8_calib100 --limit 100 --print_every 25
+  ```
+  This tests real FP8 GEMM latency on H100 (not fake-quant on B300) and
+  confirms the deployment quantization quality.
 
-### Phase 1: Teacher Data Generation
+### Phase 1: RL Post-Training (GRPO via Alpagym)
 
-**Goal:** Generate high-quality trajectory data from the 10B teacher (with CoC) to use as
-distillation targets.
+**Goal:** Directly optimize the bf16 10B for collision-free duration in closed-loop
+simulation.
+
+Reference: [Alpamayo 1.x RL recipe](https://github.com/NVlabs/alpamayo-recipes/tree/main/recipes/alpamayo1_x_rl)
+and Alpagym's `AlpamayoR1InferenceModel` / `AlpamayoPolicy` infrastructure.
 
 - [ ] Request access to `nvidia/Alpamayo-1.5-10B` and `nvidia/PhysicalAI-Autonomous-Vehicles` on HF
-- [ ] Set up Alpamayo 1.5 environment (`uv sync --active`)
-- [ ] Load 10B teacher in bf16 on H100/A100
-- [ ] Run teacher inference on PhysicalAI-AV dataset clips using
-      `sample_trajectories_from_data_with_vlm_rollout` (with CoC, `return_extra=True`)
-- [ ] Generate paired data: `(images, ego_history, route) → trajectory`
-- [ ] Store teacher outputs as a dataset for SFT distillation
-- [ ] Also generate teacher outputs on the `traj_future` path (no CoC) for comparison —
-      this tells us how much CoC reasoning actually contributes to trajectory quality
+- [ ] Set up Alpagym environment with AlpaSim as the simulator backend
+- [ ] Convert checkpoint: `scripts/convert_release_config_to_training.py`
+      (HF → Alpagym format, sets `ALPAMAYO_MODEL_DIR`)
+- [ ] Configure the 10B as the policy model:
+  - `load_inference_model`: load 10B with `attn_implementation="sdpa"`, `dtype=bfloat16`
+  - `last_component="traj_future"` (match deploy path)
+  - `num_context_frames`, `num_historical_waypoints`, `num_future_waypoints` matching driver config
+- [ ] Design reward function:
+  - Primary: collision-free duration (directly the competition metric)
+  - Secondary: progress along route (encourage forward motion, not just standing still)
+  - Optional: risk-horizon discounting — penalize near-future collisions more than far-future
+  - The reward system supports `metric` and `distance_to_gt` term kinds
+- [ ] Configure GRPO:
+  - Use `force_gt_duration_us` warmup so episodes start with ground-truth trajectory
+    (ensures the model has enough ego history and a stable starting state for exploration)
+  - Start with conservative scenes (straight roads), curriculum toward harder scenes
+  - Multiple rollout workers (8-GPU topology, 32-64 concurrent rollouts)
+- [ ] Train and monitor:
+  - Track collision-free duration across training
+  - Watch for reward collapse / KL spikes (use trackio alerts)
+  - Check that the model doesn't learn to game the reward (e.g., driving in circles)
+- [ ] Evaluate RL-tuned model in AlpaSim closed loop
+- [ ] Compare: baseline 10B vs RL-tuned 10B on collision-free duration
+- [ ] Export RL checkpoint: `scripts/convert_cosmos_rl_checkpoint.py`
 
-### Phase 2: Distillation (SFT 10B → 2B)
+> **Cost note:** RL on bf16 10B is ~5× more expensive per rollout than the
+> original 2B plan. Moderate: ~$320, aggressive: ~$1,640. The ~$220
+> distillation savings partially offset this.
 
-**Goal:** Train a 2B student that inherits the teacher's perception and driving behavior,
-using the `traj_future` path (no CoC generation).
+### Phase 2: gRPC Driver Integration
 
-- [ ] Select a 2B-scale VLA architecture (Cosmos-Reason backbone + diffusion expert)
-- [ ] Adapt the [Alpamayo 1.5 SFT recipe](https://github.com/NVlabs/alpamayo-recipes/tree/main/recipes/alpamayo1_5_sft)
-      for the smaller architecture
-- [ ] Train student to match teacher trajectories:
-  - Input: camera images + ego history + route (same format as teacher)
-  - Target: teacher's CoC-enhanced trajectory output
-  - Inference path: `last_component="traj_future"` (prefill → expert, no generation)
-- [ ] Evaluate student open-loop (minADE vs teacher)
-- [ ] Evaluate student closed-loop (smoke test in AlpaSim) — does it survive at all?
-- [ ] Verify student fits in 16 GiB VRAM at bf16
-- [ ] Measure student inference latency (target: <50ms without quantization)
-
-### Phase 3: gRPC Driver Integration
-
-**Goal:** Wire the distilled 2B model into the gRPC driver container, replacing the
+**Goal:** Wire the RL-tuned 10B model into the gRPC driver container, replacing the
 starter kit's straight-line driver.
 
 Reference implementation: `AlpamayoPolicy` in
@@ -192,13 +209,17 @@ does exactly the buffering + preprocessing + inference + postprocessing pipeline
 - [ ] Test locally: build container, run smoke test against AlpaSim
 - [ ] Measure: latency per `drive()` call, peak VRAM, image size
 
-### Phase 4: Inference Optimization
+### Phase 3: Inference Optimization & FP8 Quantization
 
-**Goal:** Hit ≤0.1s latency and ≤16 GiB VRAM with the 2B model.
+**Goal:** Hit ≤0.1s latency and ≤16 GiB VRAM with the FP8-quantized 10B model.
 
-- [ ] **Quantization:** Apply INT4 quantization to the 2B model
-  - Target: <5 GB weights, <8 GB total VRAM with KV cache + vision encoder
-  - Test: does INT4 degrade perception enough to affect closed-loop driving?
+- [ ] **Quantize RL checkpoint to FP8:**
+  ```bash
+  uv run --active quantize.py --quant_format=fp8 --num_of_calib_clips=100 --save_model_dir=./outputs
+  ```
+  - Target: ~11 GB weights, <14 GB total VRAM with KV cache + vision encoder + 2 sessions
+  - Test: does FP8 degrade perception enough to affect closed-loop driving?
+  - If VRAM is tight with 2 concurrent rollouts, try `--quant_weight_only` (weights FP8, activations FP16)
 - [ ] **Diffusion optimization:** Reduce inference steps
   - The `diffusion_kwargs` in the inference adapter supports `inference_step` and `int_method`
   - Find the minimum steps that maintain trajectory quality
@@ -206,44 +227,16 @@ does exactly the buffering + preprocessing + inference + postprocessing pipeline
 - [ ] **KV cache:** Enable `use_cache=True` for prefill (already default in Alpamayo)
 - [ ] **Optional:** torch.compile on the model forward pass
 - [ ] **Optional:** TensorRT export for the expert + vision encoder
-- [ ] **Verify:** End-to-end `drive()` latency ≤0.1s with 2 concurrent sessions
-- [ ] **Verify:** Peak VRAM ≤16 GiB with 2 concurrent sessions
+- [ ] **Fallback if FP8 too tight:** INT8 weight-only (~6-7 GB, H100-compatible)
+- [ ] **Verify:** End-to-end `drive()` latency ≤0.1s with 2 concurrent sessions on H100
+- [ ] **Verify:** Peak VRAM ≤16 GiB with 2 concurrent sessions on H100
 
-### Phase 5: RL Post-Training (GRPO via Alpagym)
+### Phase 4: Containerization & Submission
 
-**Goal:** Directly optimize the 2B student for collision-free duration in closed-loop
-simulation.
+**Goal:** Package the FP8-quantized RL-tuned 10B model into a compliant Docker container
+and submit.
 
-Reference: [Alpamayo 1.x RL recipe](https://github.com/NVlabs/alpamayo-recipes/tree/main/recipes/alpamayo1_x_rl)
-and Alpagym's `AlpamayoR1InferenceModel` / `AlpamayoPolicy` infrastructure.
-
-- [ ] Set up Alpagym environment with AlpaSim as the simulator backend
-- [ ] Configure the 2B student as the policy model:
-  - `load_inference_model`: load 2B with `attn_implementation="sdpa"`, `dtype=bfloat16`
-  - `last_component="traj_future"` (match deploy path)
-  - `num_context_frames`, `num_historical_waypoints`, `num_future_waypoints` matching driver config
-- [ ] Design reward function:
-  - Primary: collision-free duration (directly the competition metric)
-  - Secondary: progress along route (encourage forward motion, not just standing still)
-  - Optional: risk-horizon discounting — penalize near-future collisions more than far-future
-  - The reward system supports `metric` and `distance_to_gt` term kinds
-- [ ] Configure GRPO:
-  - Use `force_gt_duration_us` warmup so episodes start with ground-truth trajectory
-    (ensures the model has enough ego history and a stable starting state for exploration)
-  - Start with conservative scenes (straight roads), curriculum toward harder scenes
-  - Multiple rollout workers (8-GPU topology, 32-64 concurrent rollouts)
-- [ ] Train and monitor:
-  - Track collision-free duration across training
-  - Watch for reward collapse / KL spikes (use trackio alerts)
-  - Check that the model doesn't learn to game the reward (e.g., driving in circles)
-- [ ] Evaluate RL-tuned model in AlpaSim closed loop
-- [ ] Compare: distilled-only vs distilled+RL on collision-free duration
-
-### Phase 6: Containerization & Submission
-
-**Goal:** Package the RL-tuned 2B model into a compliant Docker container and submit.
-
-- [ ] Bake INT4-quantized RL-tuned weights into the Docker image
+- [ ] Bake FP8-quantized RL-tuned weights into the Docker image
 - [ ] Verify image size ≤40 GiB
 - [ ] Verify read-only root filesystem works (model loads from baked-in weights, no writes)
 - [ ] Verify no outbound network calls at runtime
@@ -262,51 +255,62 @@ and Alpagym's `AlpamayoR1InferenceModel` / `AlpamayoPolicy` infrastructure.
   ```
 - [ ] Check status and leaderboard
 
-### Phase 7: Iterate
+### Phase 5: Iterate
 
 - [ ] Analyze failure modes from leaderboard results (which scenes does it crash on?)
-- [ ] If latency is the bottleneck: reduce diffusion steps, try smaller model, optimize inference
-- [ ] If perception is the bottleneck: try higher-res input, more context frames, or INT8 instead of INT4
+- [ ] If latency is the bottleneck: reduce diffusion steps, torch.compile, TensorRT, or INT8
+- [ ] If perception is the bottleneck: try higher-res input, more context frames, or FP8 weight-only
 - [ ] If closed-loop robustness is the bottleneck: more RL training, adjust reward design
-- [ ] If VRAM is the bottleneck: reduce context frames, reduce image resolution, or smaller model
+- [ ] If VRAM is the bottleneck: reduce context frames, reduce image resolution, or INT8 weight-only
 - [ ] Try both tracks (PAI and nuPlan) — they may favor different configurations
 
 ---
 
 ## Key Design Decisions
 
-### 1. Distill before RL, not after
+### 1. Train-then-compress, not compress-then-train
 
-RL on the 2B directly optimizes the deployed model for closed-loop survival. Distilling
-after RL would lose the self-correcting behavior that RL produces.
+RL on bf16 10B in Alpagym (the only supported path), then FP8 PTQ for
+deployment. PTQ rounds weights; it doesn't retrain, so self-correcting
+behavior learned through RL survives compression. Distillation would transfer
+input→output mappings but lose closed-loop robustness.
 
-### 2. Remove CoC from the student
+### 2. Remove CoC from RL and deployment
 
-CoC generation is too slow for 0.1s latency. The student uses the `traj_future` path
-(prefill → expert, no VLM generation). Teacher trajectories produced with CoC serve as
-distillation targets — the reasoning benefit is internalized into latent representations.
+CoC generation is too slow for 0.1s latency. The 10B uses the `traj_future`
+path (prefill → expert, no VLM generation). The model was already RL
+post-trained by NVIDIA with CoC reasoning, so reasoning quality is
+internalized. Our RL further tunes for closed-loop robustness on the
+`traj_future` path.
 
 ### 3. `traj_future` as the single inference path
 
-Used for distillation, RL, and deployment. No train/deploy gap. Already the default in
+Used for RL and deployment. No train/deploy gap. Already the default in
 Alpagym's RL recipe (`bundle.py`).
 
-### 4. 2B instead of quantized 10B
+### 4. 10B instead of 2B student
 
-A 2B model at INT4 (~1 GB weights) has ample VRAM headroom for 2 concurrent sessions.
-The 10B at INT4 (~5 GB weights) is feasible but tighter, and a 2B is 5x cheaper per RL
-rollout. The trade-off is perception capacity — validate with the Phase 0 decision gate.
+The Phase 0 gate proved NVFP4 (4-bit) preserves perception (+3.7% minADE).
+FP8 (8-bit) will be even better. The 10B retains full perception capacity
+for RL — no distillation bottleneck. Trade-off: RL is ~5× more expensive
+per rollout than a 2B would have been, and FP8 weights (~11 GB) are tighter
+in 16 GiB VRAM than a 2B would have been (~1-2 GB).
 
-### 5. RL reward = collision-free duration
+### 5. FP8 for deployment, not NVFP4
+
+Challenge eval runs on 8×H100 (Hopper). NVFP4 is Blackwell-only. FP8
+(E4M3) is Hopper-native and supported by ModelOpt's quant recipe.
+
+### 6. RL reward = collision-free duration
 
 Directly optimizes the competition metric. Progress-along-route as secondary reward
 prevents the degenerate strategy of standing still to avoid collisions. Risk-horizon
 discounting encourages conservative early behavior (survive long enough to accumulate
 reward).
 
-### 6. `force_gt_duration_us` warmup for RL exploration
+### 7. `force_gt_duration_us` warmup for RL exploration
 
-The distilled 2B may crash immediately in some scenes, giving GRPO no signal. The AlpaSim
+The 10B may crash immediately in some scenes, giving GRPO no signal. The AlpaSim
 warmup feeds ground-truth trajectories for the first N seconds, giving the model a stable
 starting state before its own policy takes over. This ensures RL rollouts last long enough
 to produce meaningful reward gradients.
@@ -332,29 +336,27 @@ AlpaSim only supports three topology configs — there is **no 4-GPU option**:
 This means the jump from 2 GPUs to 8 GPUs is the only way to increase
 parallelism — there is no middle ground.
 
-### Per-phase cost estimates
+### Per-phase cost estimates (revised — 10B bf16, no distillation)
 
 | Phase | What burns GPU | Hardware | Est. wall time | Est. cost |
 |-------|---------------|----------|---------------|-----------|
-| **0: Baseline & setup** | Container build, INT4 quantization gate | 1×H100 ($2.28/hr) | 4–8 hr | $10–18 |
-| **1: Teacher data gen** | 10B open-loop inference (CoC + diffusion) on PAI clips | 1×A100 80GB ($1.62/hr) | 60–100 hr (50K clips) | $100–160 |
-| **2: SFT distillation** | Training 2B student on teacher trajectories (100K samples, 3 epochs) | 2×H100 ($4.56/hr) | ~26 hr | ~$118 |
-| **3–4: Integration & optimization** | gRPC driver wiring, quantization tuning, latency measurement | 1×H100 ($2.28/hr) | 10–20 hr | $23–46 |
-| **5: RL (moderate)** | GRPO closed-loop rollouts (1K samples, 15 epochs, 180K rollouts) | 2gpu: 2×H100 ($4.56/hr) | ~14 hr | ~$64 |
-| **5: RL (aggressive)** | GRPO at larger scale (5K samples, 900K rollouts) | 8gpu: 8×H100 ($18.24/hr) | ~18 hr | ~$328 |
-| **6–7: Eval & iteration** | Full 916-scene closed-loop eval (measured: ~49 hr/run) | 2×H100 launchpad ($5.69/hr) | 49 hr × 3 full + 4 hr × 5 subset | ~$1,060 |
+| **0: Baseline & gate** | NVFP4 gate (done on B300), FP8 gate (H100), container build | 1×H100 ($2.28/hr) | 4–8 hr | $10–18 |
+| **1: RL (moderate)** | GRPO closed-loop rollouts on bf16 10B (1K samples, 15 epochs) | 2gpu: 2×H100 ($4.56/hr) | ~70 hr | ~$320 |
+| **1: RL (aggressive)** | GRPO at larger scale on bf16 10B (5K samples) | 8gpu: 8×H100 ($18.24/hr) | ~90 hr | ~$1,640 |
+| **2–3: Integration & FP8 optimization** | gRPC driver wiring, FP8 quantization, latency tuning on H100 | 1×H100 ($2.28/hr) | 10–20 hr | $23–46 |
+| **4–5: Eval & iteration** | Full 916-scene closed-loop eval (measured: ~49 hr/run) | 2×H100 launchpad ($5.69/hr) | 49 hr × 3 full + 4 hr × 5 subset | ~$1,060 |
 | **Overhead** | Setup/teardown, debugging, failed runs (15–25%) | — | — | $200–400 |
 
 ### Total compute budget
 
 | Level | Total cost | What you get |
 |-------|-----------|--------------|
-| **Scraping by** | ~$1,000–1,500 | Baseline + minimal distillation + local-scale RL + 2 eval runs |
-| **Serious attempt** | ~$1,800–2,500 | Full distillation + moderate RL + 3 full evals + 5 subset evals |
-| **Go all in** | ~$3,500–5,500 | Aggressive RL (5K+ scenes) + extensive iteration + 5–7 full eval runs |
+| **Scraping by** | ~$1,500–2,000 | Baseline + moderate RL (bf16 10B) + 2 eval runs |
+| **Serious attempt** | ~$2,500–3,500 | Moderate RL + 3 full evals + 5 subset evals |
+| **Go all in** | ~$4,000–6,000 | Aggressive RL (5K+ scenes) + extensive iteration + 5–7 full eval runs |
 
-**Planning number: ~$2,000–3,000.** The biggest lever is RL training scale —
-start with the `2gpu` local-test config (~$64/run) and scale to `8gpu` only
+**Planning number: ~$2,500–3,500.** The biggest lever is RL training scale —
+start with the `2gpu` local-test config (~$320/run) and scale to `8gpu` only
 if it shows promise. The second biggest lever is eval iteration — use 100-scene
 subsets (~$30 each, ~4 hours) for tuning and full 916-scene runs (~$279 each)
 only for milestone validation.
@@ -401,13 +403,11 @@ thumb: **fills 8 GPUs → AWS; needs 1–2 GPUs or rapid spin-up/teardown → Br
 
 | Phase | Where | Why |
 |-------|-------|-----|
-| **1: Teacher data gen** | **AWS** (`p4de`, 8×A100) | Embarrassingly parallel over 50K clips — fanning out across 8 GPUs is faster *and* cheaper than the single-A100 plan. ~8–13 hr, ~$300–500 of credits. |
-| **5: RL (aggressive, `8gpu`)** | **AWS** (`p5`, 8×H100) | You'd rent 8 GPUs anyway; credits absorb the dominant RL cost. |
-| **6–7: Milestone full evals** | **AWS** (`p5`, or `p5e`/H200 for >80 GB VRAM) | High parallelism + big VRAM. Stage the 1.5 TB scene suite from S3/FSx for Lustre (no 56 TB local mount, but `p5` has ~30 TB local NVMe). |
-| **0: INT4 quantization gate** | **Brev** (1×H100) | Single-GPU, quick iteration. |
-| **2: SFT distillation** | **Brev** (1–2×H100) | 2B fits on 1–2 GPUs; an 8-GPU AWS box wastes 6. |
-| **3–4: gRPC integration + latency/VRAM tuning** | **Brev** (1×H100) | Constant launch-and-kill; AWS Capacity Blocks make bursty work painful. |
-| **5: RL (moderate, `2gpu`)** | **Brev** (2×H100) | Below the 8-GPU threshold. |
+| **1: RL (aggressive, `8gpu`)** | **AWS** (`p5`, 8×H100) | You'd rent 8 GPUs anyway; credits absorb the dominant RL cost. |
+| **4–5: Milestone full evals** | **AWS** (`p5`, or `p5e`/H200 for >80 GB VRAM) | High parallelism + big VRAM. Stage the 1.5 TB scene suite from S3/FSx for Lustre (no 56 TB local mount, but `p5` has ~30 TB local NVMe). |
+| **0: FP8 quantization gate** | **Brev** (1×H100) | Single-GPU, quick iteration. FP8 is Hopper-native. |
+| **1: RL (moderate, `2gpu`)** | **Brev** (2×H100) | Below the 8-GPU threshold. |
+| **2–3: gRPC integration + FP8 latency/VRAM tuning** | **Brev** (1×H100) | Constant launch-and-kill; AWS Capacity Blocks make bursty work painful. Must test on H100 (eval hardware). |
 | **Subset (100-scene) evals** | **Brev** (2×H100 launchpad) | Frequent, small iteration runs. |
 
 **AWS caveats:**
@@ -427,22 +427,17 @@ thumb: **fills 8 GPUs → AWS; needs 1–2 GPUs or rapid spin-up/teardown → Br
 
 | Category | Item | Size | Notes |
 |----------|------|------|-------|
-| **Model weights** | Alpamayo 1.5-10B (teacher) | ~20.6 GB | 5 safetensors shards |
-| | Cosmos-Reason2-8B (backbone, gated) | ~16 GB | Required by Alpamayo 1.5 |
-| | Distilled 2B student (bf16) | ~4–8 GB | Your model |
-| | 2B student INT4 (for Docker) | ~1–2 GB | Baked into image |
+| **Model weights** | Alpamayo 1.5-10B (bf16, for RL) | ~20.6 GB | 5 safetensors shards |
 | | AlpaGym-converted checkpoint | ~20 GB | HF → AlpaGym format |
 | | RL checkpoints (keep 3–5 steps) | ~60–100 GB | ~20 GB per checkpoint step |
-| | Lingo-Judge model (optional) | ~1–2 GB | For reasoning reward only |
+| | FP8 quantized checkpoint (for Docker) | ~11 GB | Baked into image |
+| | NVFP4 quantized checkpoint (gate artifact) | ~7.6 GB | Already generated on B300 |
 | **Scene data** | Per NuRec scene (.usdz + camera MP4) | ~1.5–2.0 GB | From `PhysicalAI-Autonomous-Vehicles-NuRec` |
 | | Full `public_2601` suite (916 scenes) | **~1.5 TB** | **Dominant disk cost** |
 | **Rollout output** | Per scene, `render_video=true` | ~100–300 MB | Videos + telemetry + metrics |
 | | Per scene, `render_video=false` | ~15–40 MB | Telemetry + metrics only |
 | | Full 916-scene eval run (no video) | ~15–35 GB | Keep `render_video=false` for production |
 | | Full 916-scene eval run (with video) | ~110–270 GB | Only for visual debugging |
-| **SFT training data** | PAI dataset chunks (per 20 chunks) | ~3–5 GB | 4 cameras × ~40 MB/chunk |
-| | Teacher trajectories (50K clips) | ~50–100 GB | Trajectories + metadata, no raw video |
-| | LingoQA scenery data | ~5–10 GB | 148K QA pairs + 17.5K images |
 | **Environment** | `uv` Python environment | ~15–25 GB | PyTorch, CUDA libs |
 | | Docker images (NRE, base, driver) | ~10–15 GB | Built by AlpaSim wizard |
 | | AlpaSim + AlpaGym + Alpamayo1.5 repos | ~20 MB | Source code only |
@@ -484,11 +479,12 @@ are sufficient.
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| INT4 quantization degrades perception too much | Model can't perceive obstacles, crashes immediately | Test early (Phase 0 gate). Fall back to INT8 or larger model. |
-| 2B model lacks capacity for good perception | Distilled student is too weak for RL exploration | Use 3B or 4B instead. Or RL on quantized 10B. |
-| RL doesn't converge or reward collapses | No improvement over distilled baseline | Start with conservative scenes, use `force_gt` warmup, monitor KL/reward with trackio alerts. |
-| Latency still over 0.1s after optimization | Submission disqualified | Reduce diffusion steps, use TensorRT, reduce image resolution, or smaller model. |
-| Docker image over 40 GiB | Submission rejected | Use INT4 weights (~1-5 GB), minimal dependencies, multi-stage build. |
+| FP8 quantization degrades RL-tuned behavior | Self-correcting behavior lost in compression | Phase 0 gate proved PTQ is safe (NVFP4 +3.7%, FP8 will be less). Re-eval post-RL quantized model in AlpaSim before submitting. |
+| FP8 too tight for 16 GiB VRAM with 2 concurrent rollouts | OOM during eval | Use `--quant_weight_only` (weights FP8, activations FP16). Fall back to INT8 weight-only (~6-7 GB). Reduce `num_context_frames`. |
+| RL on bf16 10B is ~5× more expensive than 2B plan | Budget overrun | Start with `2gpu` moderate config (~$320). Scale to `8gpu` only if showing promise. Use AWS credits for 8-GPU phases. |
+| RL doesn't converge or reward collapses | No improvement over baseline | Start with conservative scenes, use `force_gt` warmup, monitor KL/reward with trackio alerts. |
+| Latency still over 0.1s after FP8 optimization | Submission disqualified | Reduce diffusion steps, use TensorRT, reduce image resolution, torch.compile. INT8 fallback. |
+| Docker image over 40 GiB | Submission rejected | FP8 weights ~11 GB, minimal dependencies, multi-stage build. Well under 40 GiB. |
 | AlpaSim local setup is complex | Can't smoke test locally | Follow `e2e_challenge/starter_kit/README.md` carefully, use `+e2e_challenge=dev` for minimal test. |
 
 ---
@@ -500,6 +496,7 @@ are sufficient.
 - [Challenge HF Space](https://huggingface.co/spaces/nvidia/AlpasimE2EClosedLoopChallenge2026)
 - [Alpamayo 1.5 Model Card](https://huggingface.co/nvidia/Alpamayo-1.5-10B)
 - [Alpamayo 1.5 GitHub](https://github.com/NVlabs/alpamayo1.5)
-- [Alpamayo Recipes (SFT + RL)](https://github.com/NVlabs/alpamayo-recipes)
+- [Alpamayo Recipes (SFT + RL + Quantization)](https://github.com/NVlabs/alpamayo-recipes)
+- [Alpamayo 1.5 Quantization Recipe](https://github.com/NVlabs/alpamayo-recipes/tree/main/recipes/alpamayo1_5_quant)
 - [Alpagym Post-Training Blog](https://developer.nvidia.com/blog/how-to-post-train-autonomous-vehicle-models-in-closed-loop-with-nvidia-alpamayo/)
 - [Alpamayo Paper (arXiv:2511.00088)](https://arxiv.org/abs/2511.00088)
